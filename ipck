@@ -1,0 +1,152 @@
+#!/bin/bash
+
+logfile=""
+limit=10
+only_bots=false
+use_abuseip=false
+cache_file="$HOME/.cache/ipck_abuse_cache"
+mkdir -p "$(dirname "$cache_file")"
+
+RED="\e[31m"
+GREEN="\e[32m"
+RESET="\e[0m"
+
+# Set your AbuseIPDB API key here, or export it as ABUSE_KEY in your environment
+ABUSE_KEY="${ABUSE_KEY:-YOUR_ABUSEIPDB_API_KEY_HERE}"
+
+# Parse args
+for arg in "$@"; do
+    case "$arg" in
+        --onlybots)
+            only_bots=true
+            use_abuseip=true
+            ;;
+        --abuseip)
+            use_abuseip=true
+            ;;
+        --*)
+            echo -e "${RED}Unknown flag:${RESET} $arg"
+            exit 1
+            ;;
+        *)
+            if [[ -z "$logfile" && -f "$arg" ]]; then
+                logfile="$arg"
+            elif [[ "$arg" =~ ^[0-9]+$ ]]; then
+                limit="$arg"
+            fi
+            ;;
+    esac
+done
+
+if [[ -z "$logfile" ]]; then
+    echo -e "${RED}Usage:${RESET} ipck LOG_FILE [LIMIT] [--abuseip] [--onlybots]"
+    exit 1
+fi
+
+# AbuseIPDB check
+get_abuse_info() {
+    local ip=$1
+
+    local cached_line
+    cached_line=$(grep "^$ip|" "$cache_file" 2>/dev/null)
+
+    if [[ -n "$cached_line" ]]; then
+        info="${cached_line#*|}"
+        echo "$info"
+        [[ "$info" == Likely\ Bot* ]] && return 0 || return 1
+    fi
+
+    if ! $use_abuseip; then
+        echo "Unknown [not checked]"
+        return 1
+    fi
+
+    local response
+    response=$(curl -sG https://api.abuseipdb.com/api/v2/check \
+        --data-urlencode "ipAddress=$ip" \
+        -d maxAgeInDays=90 \
+        -H "Key: $ABUSE_KEY" \
+        -H "Accept: application/json")
+
+    local score reports
+    score=$(echo "$response" | jq -r '.data.abuseConfidenceScore')
+    reports=$(echo "$response" | jq -r '.data.totalReports')
+
+    if [[ "$score" == "null" ]]; then
+        echo "$ip|Unknown [No Data]" >> "$cache_file"
+        echo "Unknown [No Data]"
+        return 1
+    elif [[ "$score" -ge 50 ]]; then
+        result="Likely Bot [Score: $score, Reports: $reports]"
+        echo "$ip|$result" >> "$cache_file"
+        echo "$result"
+        return 0
+    else
+        result="Unknown [Score: $score, Reports: $reports]"
+        echo "$ip|$result" >> "$cache_file"
+        echo "$result"
+        return 1
+    fi
+}
+
+# Output starts here
+total_requests=$(wc -l < "$logfile" | xargs)
+echo -e "${GREEN}Total requests in $logfile: $total_requests${RESET}"
+echo ""
+
+if $only_bots || $use_abuseip; then
+    printf "+------+-----------------+----------+------------------------------------------+----------------------------------------------+\n"
+    printf "| %-4s | %-15s | %-8s | %-40s | %-44s |\n" "Rank" "IP Address" "Requests" "Hostname" "Abuse Status"
+    printf "+------+-----------------+----------+------------------------------------------+----------------------------------------------+\n"
+else
+    printf "+------+-----------------+----------+------------------------------------------+\n"
+    printf "| %-4s | %-15s | %-8s | %-40s |\n" "Rank" "IP Address" "Requests" "Hostname"
+    printf "+------+-----------------+----------+------------------------------------------+\n"
+fi
+
+mapfile -t ip_list < <(awk '{print $1}' "$logfile" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort | uniq -c | sort -nr)
+
+counter=0
+rank=1
+for entry in "${ip_list[@]}"; do
+    count=$(awk '{print $1}' <<< "$entry")
+    ip=$(awk '{print $2}' <<< "$entry")
+    hostname=$(host "$ip" 2>/dev/null | awk '/domain name pointer/ {print $5}' | sed 's/\.$//' || true)
+    hostname="${hostname:-No PTR Record}"
+
+    if $only_bots || $use_abuseip; then
+        abuse_info=$(get_abuse_info "$ip")
+        is_bot=$?
+    fi
+
+    if $only_bots; then
+        if [[ "$is_bot" -eq 0 ]]; then
+            printf "${RED}| %-4s | %-15s | %-8s | %-40s | %-44s |${RESET}\n" "$rank" "$ip" "$count" "$hostname" "$abuse_info"
+            ((counter++))
+            ((rank++))
+        fi
+        [[ "$counter" -ge "$limit" ]] && break
+
+    elif $use_abuseip; then
+        if [[ "$is_bot" -eq 0 ]]; then
+            printf "${RED}| %-4s | %-15s | %-8s | %-40s | %-44s |${RESET}\n" "$rank" "$ip" "$count" "$hostname" "$abuse_info"
+        else
+            printf "${GREEN}| %-4s | %-15s | %-8s | %-40s | %-44s |${RESET}\n" "$rank" "$ip" "$count" "$hostname" "$abuse_info"
+        fi
+        ((counter++))
+        ((rank++))
+        [[ "$counter" -ge "$limit" ]] && break
+
+    else
+        printf "| %-4s | %-15s | %-8s | %-40s |\n" "$rank" "$ip" "$count" "$hostname"
+        ((counter++))
+        ((rank++))
+        [[ "$counter" -ge "$limit" ]] && break
+    fi
+done
+
+if $only_bots || $use_abuseip; then
+    printf "+------+-----------------+----------+------------------------------------------+----------------------------------------------+\n"
+else
+    printf "+------+-----------------+----------+------------------------------------------+\n"
+fi
